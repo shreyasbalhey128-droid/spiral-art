@@ -1,0 +1,511 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Spiral Art</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin:0; height:100%; background:#000; color:#eee; font-family: system-ui, -apple-system, Segoe UI, sans-serif; }
+  body { display:flex; flex-direction:column; }
+  #controls {
+    display:flex; flex-wrap:wrap; gap:10px 16px; align-items:center;
+    padding:10px 14px; background:#141414; border-bottom:1px solid #2a2a2a; font-size:14px;
+  }
+  #controls label { display:flex; align-items:center; gap:6px; }
+  #controls input[type="text"] { width:150px; padding:5px 7px; background:#222; color:#eee; border:1px solid #444; border-radius:4px; }
+  #controls select { padding:5px 7px; background:#222; color:#eee; border:1px solid #444; border-radius:4px; }
+  #controls input[type="range"] { width:140px; }
+  #controls input[type="color"] {
+    appearance: none;
+    border: none;
+    width: 28px;
+    height: 28px;
+    border-radius: 4px;
+    cursor: pointer;
+    background: none;
+  }
+  #controls input[type="color"]::-webkit-color-swatch-wrapper { padding: 0; }
+  #controls input[type="color"]::-webkit-color-swatch { border: 1px solid #444; border-radius: 4px; }
+  #controls button, #controls input[type="file"]::file-selector-button {
+    background:#c0392b; color:#fff; border:none; padding:7px 12px; border-radius:4px; cursor:pointer; font-size:14px;
+  }
+  #controls button:hover, #controls input[type="file"]::file-selector-button:hover { background:#e74c3c; }
+  #ringsVal { min-width:2.5em; text-align:right; font-variant-numeric: tabular-nums; }
+  #hint { color:#999; font-size:13px; }
+  #stage { flex:1; min-height:0; position:relative; }
+  canvas { position:absolute; inset:0; width:100%; height:100%; display:block; }
+</style>
+</head>
+<body>
+
+<div id="controls">
+  <input type="file" id="fileInput" accept="image/*">
+  <label>Text: <input type="text" id="textInput" value="SPIRAL "></label>
+  <label>Mode:
+    <select id="modeSelect">
+      <option value="auto">Auto</option>
+      <option value="background" selected>Background</option>
+      <option value="brightness">Brightness</option>
+      <option value="saturation">Saturation</option>
+    </select>
+  </label>
+  <label>Colour:
+    <select id="colourSelect">
+      <option value="picture" selected>Picture's colours</option>
+      <option value="rainbow">Rainbow</option>
+      <option value="custom">Custom Color</option>
+    </select>
+  </label>
+  <label id="customColorLabel" style="display:none;">Picker: <input type="color" id="customColorInput" value="#ff3333"></label>
+  <label>Rings: <input type="range" id="ringsSlider" min="30" max="200" step="5" value="100"><span id="ringsVal">100</span></label>
+  <button id="generateBtn">Generate</button>
+  <button id="defaultBtn">Default</button>
+  <button id="downloadBtn">Download image</button>
+  <span id="hint">Upload a photo to begin</span>
+</div>
+
+<div id="stage"><canvas id="cv"></canvas></div>
+
+<script>
+// ================= settings =================
+const DEFAULTS = { mode: "background", colour: "picture", customColor: "#ff3333", rings: 100 };
+
+// how strict each mode is about skipping dim/background spots (0 to 1)
+const DEFAULT_THRESH = { brightness: 0.40, background: 0.35, saturation: 0.45 };
+
+const FLOOR = 90;          // dimmest a letter can be (0-255). Higher = brighter picture
+const MAX_SIZE = 1200;     // biggest working picture in pixels (keeps things fast)
+const LETTER_SPACING = 0.55;
+const FRAME_BUDGET_MS = 12; // how long we spend drawing letters each frame
+// ============================================
+
+const canvas = document.getElementById("cv");
+const ctx = canvas.getContext("2d");
+const stage = document.getElementById("stage");
+
+const fileInput        = document.getElementById("fileInput");
+const textInput        = document.getElementById("textInput");
+const modeSelect       = document.getElementById("modeSelect");
+const colourSelect     = document.getElementById("colourSelect");
+const customColorInput = document.getElementById("customColorInput");
+const customColorLabel = document.getElementById("customColorLabel");
+const ringsSlider      = document.getElementById("ringsSlider");
+const ringsVal         = document.getElementById("ringsVal");
+const defaultBtn       = document.getElementById("defaultBtn");
+const hint             = document.getElementById("hint");
+
+// current choices
+let MODE = DEFAULTS.mode;
+let COLOUR = DEFAULTS.colour;
+let CUSTOM_COLOR = DEFAULTS.customColor;
+let RINGS = DEFAULTS.rings;
+let LETTERS = Array.from("SPIRAL ");
+
+// working data
+let SIZE, GAP, MIN_FONT, MAX_FONT, cx, cy, THRESH;
+let gateData, shadeData, colourData;
+let theta, idx, animId = null;
+let lastImage = null;
+let generated = false;   // becomes true once Generate is pressed
+
+// ---------- sizing ----------
+function resizeCanvas() {
+  canvas.width = Math.max(100, stage.clientWidth);
+  canvas.height = Math.max(100, stage.clientHeight);
+}
+
+function computeSize() {
+  SIZE = Math.floor(Math.min(canvas.width, canvas.height) * 0.95);
+  if (SIZE > MAX_SIZE) SIZE = MAX_SIZE;
+  cx = Math.floor(canvas.width / 2);
+  cy = Math.floor(canvas.height / 2);
+}
+
+function updateGap() {
+  GAP = SIZE / 2 / RINGS;
+  MIN_FONT = Math.max(3, GAP * 0.55);
+  MAX_FONT = Math.max(5, GAP * 1.15);
+}
+
+// ---------- image helpers ----------
+function sourceCornerColour(img) {
+  const t = document.createElement("canvas");
+  t.width = t.height = 32;
+  const tc = t.getContext("2d", { willReadFrequently: true });
+  tc.drawImage(img, 0, 0, 32, 32);
+  const pts = [[0, 0], [31, 0], [0, 31], [31, 31]];
+  const sum = [0, 0, 0];
+  for (const [x, y] of pts) {
+    const px = tc.getImageData(x, y, 1, 1).data;
+    sum[0] += px[0]; sum[1] += px[1]; sum[2] += px[2];
+  }
+  return sum.map(v => Math.round(v / 4));
+}
+
+function boxBlur(src, n, r) {
+  const tmp = new Float32Array(n * n);
+  const out = new Float32Array(n * n);
+  const win = 2 * r + 1;
+  for (let y = 0; y < n; y++) {
+    const row = y * n;
+    let sum = 0;
+    for (let x = -r; x <= r; x++) sum += src[row + Math.min(n - 1, Math.max(0, x))];
+    for (let x = 0; x < n; x++) {
+      tmp[row + x] = sum / win;
+      sum += src[row + Math.min(n - 1, x + r + 1)] - src[row + Math.max(0, x - r)];
+    }
+  }
+  for (let x = 0; x < n; x++) {
+    let sum = 0;
+    for (let y = -r; y <= r; y++) sum += tmp[Math.min(n - 1, Math.max(0, y)) * n + x];
+    for (let y = 0; y < n; y++) {
+      out[y * n + x] = sum / win;
+      sum += tmp[Math.min(n - 1, y + r + 1) * n + x] - tmp[Math.max(0, y - r) * n + x];
+    }
+  }
+  return out;
+}
+
+// fills small holes in a 0/1 map: grow it, then shrink it back
+function closing(bin, n, r) {
+  const grown = boxBlur(bin, n, r);
+  for (let p = 0; p < grown.length; p++) grown[p] = grown[p] > 0.001 ? 1 : 0;
+  const shrunk = boxBlur(grown, n, r);
+  for (let p = 0; p < shrunk.length; p++) shrunk[p] = shrunk[p] > 0.999 ? 1 : 0;
+  return shrunk;
+}
+
+// stretches values so the darkest is 0 and the brightest is 1
+function stretch(arr) {
+  let mn = Infinity, mx = -Infinity;
+  for (let p = 0; p < arr.length; p++) {
+    if (arr[p] < mn) mn = arr[p];
+    if (arr[p] > mx) mx = arr[p];
+  }
+  const range = Math.max(mx - mn, 1e-6);
+  for (let p = 0; p < arr.length; p++) arr[p] = (arr[p] - mn) / range;
+}
+
+function averageIn(arr, n, x0, y0, x1, y1) {
+  let s = 0, c = 0;
+  for (let y = y0; y < y1; y += 3) {
+    for (let x = x0; x < x1; x += 3) { s += arr[y * n + x]; c++; }
+  }
+  return c ? s / c : 0;
+}
+
+// picks a mode by looking at the picture (used when Mode = Auto)
+function chooseMode(sat, n, cornerSpread) {
+  if (cornerSpread < 25) return "background";   // all four corners look alike
+  const t = Math.floor(n * 0.08);
+  const edge = (
+    averageIn(sat, n, 0, 0, n, t) + averageIn(sat, n, 0, n - t, n, n) +
+    averageIn(sat, n, 0, 0, t, n) + averageIn(sat, n, n - t, 0, n, n)
+  ) / 4;
+  const centre = averageIn(sat, n, Math.floor(n * 0.3), Math.floor(n * 0.3), Math.floor(n * 0.7), Math.floor(n * 0.7));
+  if (edge < 0.15 && centre > edge + 0.15) return "saturation"; // grey surroundings, colourful subject
+  return "brightness";
+}
+
+// ---------- the main image processing ----------
+function processImage(img) {
+  computeSize();
+  const n = SIZE;
+  const off = document.createElement("canvas");
+  off.width = off.height = n;
+  const octx = off.getContext("2d", { willReadFrequently: true });
+
+  const w = img.width, h = img.height;
+  if (h > w * 1.15) {
+    // tall picture: fit it whole, pad the sides with the picture's own background colour
+    const sb = sourceCornerColour(img);
+    octx.fillStyle = `rgb(${sb[0]},${sb[1]},${sb[2]})`;
+    octx.fillRect(0, 0, n, n);
+    const s = Math.min(n / w, n / h);
+    const dw = w * s, dh = h * s;
+    octx.drawImage(img, (n - dw) / 2, (n - dh) / 2, dw, dh);
+  } else {
+    // wide or square picture: crop to a centred square
+    const s = Math.max(n / w, n / h);
+    const dw = w * s, dh = h * s;
+    octx.drawImage(img, (n - dw) / 2, (n - dh) / 2, dw, dh);
+  }
+
+  const d = octx.getImageData(0, 0, n, n).data;
+  const N = n * n;
+
+  // the four corner colours
+  const corners = [[0, 0], [n - 1, 0], [0, n - 1], [n - 1, n - 1]].map(([x, y]) => {
+    const i = (y * n + x) * 4;
+    return [d[i], d[i + 1], d[i + 2]];
+  });
+  const bg = [0, 1, 2].map(ch => Math.round(corners.reduce((s, c) => s + c[ch], 0) / 4));
+  let cornerSpread = 0;
+  for (let ch = 0; ch < 3; ch++) {
+    const vals = corners.map(c => c[ch]);
+    cornerSpread = Math.max(cornerSpread, Math.max(...vals) - Math.min(...vals));
+  }
+
+  // per-pixel brightness, saturation and value
+  const lum = new Float32Array(N);
+  const sat = new Float32Array(N);
+  const val = new Float32Array(N);
+  for (let p = 0; p < N; p++) {
+    const i = p * 4;
+    const R = d[i], G = d[i + 1], B = d[i + 2];
+    const mx = Math.max(R, G, B), mn = Math.min(R, G, B);
+    lum[p] = (0.299 * R + 0.587 * G + 0.114 * B) / 255;
+    val[p] = mx / 255;
+    sat[p] = mx ? (mx - mn) / mx : 0;
+  }
+
+  let used = MODE;
+  if (used === "auto") used = chooseMode(sat, n, cornerSpread);
+
+  let gate, shade;
+  if (used === "brightness") {
+    gate = lum;
+    stretch(gate);
+    shade = gate;
+  } else if (used === "background") {
+    gate = new Float32Array(N);
+    for (let p = 0; p < N; p++) {
+      const i = p * 4;
+      gate[p] = Math.max(Math.abs(d[i] - bg[0]), Math.abs(d[i + 1] - bg[1]), Math.abs(d[i + 2] - bg[2]));
+    }
+    stretch(gate);
+    shade = gate;
+  } else {
+    // saturation: colourful parts are the subject, grey parts are background
+    const blurred = boxBlur(sat, n, 3);
+    stretch(blurred);
+    const bin = new Float32Array(N);
+    for (let p = 0; p < N; p++) bin[p] = blurred[p] > 0.25 ? 1 : 0;
+    const closed = closing(bin, n, Math.max(3, Math.round(n * 0.015)));
+    gate = new Float32Array(N);
+    for (let p = 0; p < N; p++) gate[p] = closed[p] ? 1 : blurred[p];
+    shade = val;
+    stretch(shade);
+  }
+
+  gateData = gate;
+  shadeData = shade;
+  colourData = d;
+  THRESH = DEFAULT_THRESH[used];
+  return used;
+}
+
+// ---------- colours ----------
+function hsvToRgb(h, s, v) {
+  const k = Math.floor(h * 6);
+  const f = h * 6 - k;
+  const p = v * (1 - s), q = v * (1 - f * s), t = v * (1 - (1 - f) * s);
+  let r, g, b;
+  switch (k % 6) {
+    case 0: r = v; g = t; b = p; break;
+    case 1: r = q; g = v; b = p; break;
+    case 2: r = p; g = v; b = t; break;
+    case 3: r = p; g = q; b = v; break;
+    case 4: r = t; g = p; b = v; break;
+    default: r = v; g = p; b = q;
+  }
+  return [Math.round(r * 255), Math.round(g * 255), Math.round(b * 255)];
+}
+
+function hexToRgb(hex) {
+  let c = hex.replace("#", "");
+  if (c.length === 3) c = c.split("").map(x => x + x).join("");
+  const num = parseInt(c, 16);
+  return [(num >> 16) & 255, (num >> 8) & 255, num & 255];
+}
+
+function makeColour(ix, iy, r, b) {
+  if (COLOUR === "picture") {
+    const i = (iy * SIZE + ix) * 4;
+    let R = colourData[i], G = colourData[i + 1], B = colourData[i + 2];
+    const k = (FLOOR + (255 - FLOOR) * b) / Math.max(R, G, B, 1);
+    R = Math.min(255, Math.round(R * k));
+    G = Math.min(255, Math.round(G * k));
+    B = Math.min(255, Math.round(B * k));
+    return `rgb(${R},${G},${B})`;
+  }
+  if (COLOUR === "rainbow") {
+    const hue = (r / (SIZE / 2)) % 1;
+    const [R, G, B] = hsvToRgb(hue, 0.9, 0.35 + 0.65 * b);
+    return `rgb(${R},${G},${B})`;
+  }
+  // Custom color tinted by brightness shading (b)
+  const baseRgb = hexToRgb(CUSTOM_COLOR);
+  const R = Math.round(baseRgb[0] * b);
+  const G = Math.round(baseRgb[1] * b);
+  const B = Math.round(baseRgb[2] * b);
+  return `rgb(${R},${G},${B})`;
+}
+
+// ---------- drawing the spiral ----------
+function step() {
+  const t0 = performance.now();
+  while (performance.now() - t0 < FRAME_BUDGET_MS) {
+    const r = GAP * theta / (2 * Math.PI);
+    if (r > SIZE / 2) {
+      animId = null;
+      hint.textContent = hint.textContent.replace("Drawing...", "Done.");
+      return;
+    }
+    const x = cx + r * Math.cos(theta);
+    const y = cy + r * Math.sin(theta);
+    const ix = Math.floor(x - cx + SIZE / 2);
+    const iy = Math.floor(y - cy + SIZE / 2);
+
+    let g = 0, b = 0;
+    if (ix >= 0 && ix < SIZE && iy >= 0 && iy < SIZE) {
+      const p = iy * SIZE + ix;
+      g = gateData[p];
+      b = shadeData[p];
+    }
+    const size = MIN_FONT + (MAX_FONT - MIN_FONT) * b;
+
+    if (g > THRESH) {
+      ctx.save();
+      ctx.translate(x, y);
+      ctx.rotate(theta + Math.PI / 2);
+      ctx.fillStyle = makeColour(ix, iy, r, b);
+      ctx.font = `bold ${size}px Consolas, monospace`;
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText(LETTERS[idx % LETTERS.length], 0, 0);
+      ctx.restore();
+    }
+
+    idx += 1;
+    theta += Math.min(size * LETTER_SPACING / Math.max(r, 1), 0.5);
+  }
+  animId = requestAnimationFrame(step);
+}
+
+fn render(reprocess) {
+  if (!lastImage || !generated) return;
+  if (animId) cancelAnimationFrame(animId);
+  ctx.fillStyle = "black";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  let note = "";
+  if (reprocess) {
+    const used = processImage(lastImage);
+    note = MODE === "auto" ? `Auto picked ${used} mode. ` : "";
+    render.note = note;
+  } else {
+    note = render.note || "";
+  }
+  updateGap();
+  hint.textContent = note + "Drawing...";
+  theta = 4 * Math.PI;
+  idx = 0;
+  animId = requestAnimationFrame(step);
+}
+
+// ---------- buttons and boxes ----------
+fileInput.addEventListener("change", (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = (ev) => {
+    const img = new Image();
+    img.onload = () => {
+      lastImage = img;
+      generated = false;
+      if (animId) { cancelAnimationFrame(animId); animId = null; }
+      ctx.fillStyle = "black";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      hint.textContent = "Photo loaded. Press Generate.";
+    };
+    img.src = ev.target.result;
+  };
+  reader.readAsDataURL(file);
+});
+
+function readText() {
+  let t = textInput.value;
+  if (!t.length) t = "SPIRAL";
+  if (!t.endsWith(" ")) t += " ";
+  LETTERS = Array.from(t);
+}
+
+textInput.addEventListener("change", () => { readText(); render(false); });
+
+modeSelect.addEventListener("change", () => { MODE = modeSelect.value; render(true); });
+
+colourSelect.addEventListener("change", () => {
+  COLOUR = colourSelect.value;
+  customColorLabel.style.display = (COLOUR === "custom") ? "flex" : "none";
+  render(false);
+});
+
+customColorInput.addEventListener("input", () => {
+  CUSTOM_COLOR = customColorInput.value;
+  if (COLOUR === "custom") render(false);
+});
+
+ringsSlider.addEventListener("input", () => { ringsVal.textContent = ringsSlider.value; });
+ringsSlider.addEventListener("change", () => { RINGS = parseInt(ringsSlider.value, 10); render(false); });
+
+defaultBtn.addEventListener("click", () => {
+  MODE = DEFAULTS.mode;               modeSelect.value = MODE;
+  COLOUR = DEFAULTS.colour;           colourSelect.value = COLOUR;
+  CUSTOM_COLOR = DEFAULTS.customColor; customColorInput.value = CUSTOM_COLOR;
+  customColorLabel.style.display = "none";
+  RINGS = DEFAULTS.rings;             ringsSlider.value = RINGS; ringsVal.textContent = RINGS;
+  render(true);
+});
+
+document.getElementById("generateBtn").addEventListener("click", () => {
+  if (!lastImage) { hint.textContent = "Upload a photo first."; return; }
+  readText();
+  MODE = modeSelect.value;
+  COLOUR = colourSelect.value;
+  CUSTOM_COLOR = customColorInput.value;
+  RINGS = parseInt(ringsSlider.value, 10);
+  generated = true;
+  render(true);
+});
+
+document.getElementById("downloadBtn").addEventListener("click", () => {
+  if (!lastImage || !generated) { hint.textContent = "Press Generate first."; return; }
+  const out = document.createElement("canvas");
+  out.width = out.height = SIZE;
+  const octx = out.getContext("2d");
+  octx.fillStyle = "black";
+  octx.fillRect(0, 0, SIZE, SIZE);
+  octx.drawImage(canvas, cx - SIZE / 2, cy - SIZE / 2, SIZE, SIZE, 0, 0, SIZE, SIZE);
+  out.toBlob((blob) => {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "spiral-art.png";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }, "image/png");
+});
+
+let resizeTimer = null;
+window.addEventListener("resize", () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(() => {
+    resizeCanvas();
+    ctx.fillStyle = "black";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    render(true);
+  }, 250);
+});
+
+// ---------- start ----------
+resizeCanvas();
+ctx.fillStyle = "black";
+ctx.fillRect(0, 0, canvas.width, canvas.height);
+readText();
+</script>
+</body>
+</html>
