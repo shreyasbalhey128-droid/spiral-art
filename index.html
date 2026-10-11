@@ -47,6 +47,7 @@
     </select>
   </label>
   <label>Rings: <input type="range" id="ringsSlider" min="30" max="200" step="5" value="100"><span id="ringsVal">100</span></label>
+  <button id="generateBtn">Generate</button>
   <button id="defaultBtn">Default</button>
   <button id="downloadBtn">Download image</button>
   <span id="hint">Upload a photo to begin</span>
@@ -91,6 +92,7 @@ let SIZE, GAP, MIN_FONT, MAX_FONT, cx, cy, THRESH;
 let gateData, shadeData, colourData;
 let theta, idx, animId = null;
 let lastImage = null;
+let generated = false;   // becomes true once Generate is pressed
 
 // ---------- sizing ----------
 function resizeCanvas() {
@@ -359,7 +361,7 @@ function step() {
 }
 
 function render(reprocess) {
-  if (!lastImage) return;
+  if (!lastImage || !generated) return;
   if (animId) cancelAnimationFrame(animId);
   ctx.fillStyle = "black";
   ctx.fillRect(0, 0, canvas.width, canvas.height);
@@ -386,7 +388,14 @@ fileInput.addEventListener("change", (e) => {
   const reader = new FileReader();
   reader.onload = (ev) => {
     const img = new Image();
-    img.onload = () => { lastImage = img; render(true); };
+    img.onload = () => {
+      lastImage = img;
+      generated = false;
+      if (animId) { cancelAnimationFrame(animId); animId = null; }
+      ctx.fillStyle = "black";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      hint.textContent = "Photo loaded. Press Generate.";
+    };
     img.src = ev.target.result;
   };
   reader.readAsDataURL(file);
@@ -415,8 +424,18 @@ defaultBtn.addEventListener("click", () => {
   render(true);
 });
 
-document.getElementById("downloadBtn").addEventListener("click", () => {
+document.getElementById("generateBtn").addEventListener("click", () => {
   if (!lastImage) { hint.textContent = "Upload a photo first."; return; }
+  readText();
+  MODE = modeSelect.value;
+  COLOUR = colourSelect.value;
+  RINGS = parseInt(ringsSlider.value, 10);
+  generated = true;
+  render(true);
+});
+
+document.getElementById("downloadBtn").addEventListener("click", () => {
+  if (!lastImage || !generated) { hint.textContent = "Press Generate first."; return; }
   // save just the square the spiral sits in, on black
   const out = document.createElement("canvas");
   out.width = out.height = SIZE;
