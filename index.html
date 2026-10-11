@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Spiral Art</title>
+<style>
+  html, body { margin:0; padding:0; background:#000; height:100%; overflow:hidden; font-family: Consolas, monospace; }
+  #controls {
+    position:fixed; top:0; left:0; right:0; z-index:10;
+    background:rgba(20,20,20,0.85); color:#eee; padding:10px 14px;
+    display:flex; gap:12px; align-items:center; flex-wrap:wrap; font-size:14px;
+  }
+  #controls label { display:flex; align-items:center; gap:6px; }
+  #controls input[type="text"] { width:160px; padding:4px 6px; }
+  #controls button, #controls select, #controls input[type="file"]::file-selector-button {
+    background:#c0392b; color:#fff; border:none; padding:6px 10px; border-radius:4px; cursor:pointer;
+  }
+  #controls button:hover { background:#e74c3c; }
+  canvas { display:block; }
+  #hint { color:#888; font-size:12px; }
+</style>
+</head>
+<body>
+
+<div id="controls">
+  <input type="file" id="fileInput" accept="image/*">
+  <label>Text: <input type="text" id="textInput" value="BMW "></label>
+  <label>Colour:
+    <select id="colourSelect">
+      <option value="picture" selected>Picture's colours</option>
+      <option value="red">Red</option>
+      <option value="rainbow">Rainbow</option>
+    </select>
+  </label>
+  <button id="defaultBtn">Default</button>
+  <span id="hint">Upload a photo to begin</span>
+</div>
+
+<canvas id="cv"></canvas>
+
+<script>
+// ---------------- settings ----------------
+const MODE = "background";   // always background mode, as decided
+let COLOUR = "picture";      // "picture", "red", "rainbow"
+let TEXT = "BMW ";
+const RINGS = 70;
+const THRESH = 0.35;
+const FLOOR = 90;            // minimum letter brightness 0-255
+const PER_FRAME = 40;
+const DELAY_MS = 1;
+// -------------------------------------------
+
+const canvas = document.getElementById("cv");
+const ctx = canvas.getContext("2d");
+canvas.width = window.innerWidth;
+canvas.height = window.innerHeight;
+ctx.fillStyle = "black";
+ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+let SIZE, GAP, MIN_FONT, MAX_FONT;
+let gateData, shadeData, colourData; // Uint8ClampedArray-backed pixel reads
+let cx, cy;
+let theta, i, animId;
+
+function setupSizing() {
+  SIZE = Math.floor(Math.min(canvas.width, canvas.height) * 0.95);
+  GAP = SIZE / 2 / RINGS;
+  MIN_FONT = GAP * 0.55;
+  MAX_FONT = GAP * 1.15;
+  cx = Math.floor(canvas.width / 2);
+  cy = Math.floor(canvas.height / 2);
+}
+
+// draws the uploaded image into an offscreen canvas sized SIZE x SIZE,
+// using "background" mode: background colour = average of 4 corners,
+// gate/shade = how different each pixel is from that colour.
+function loadImage(img) {
+  setupSizing();
+
+  const off = document.createElement("canvas");
+  off.width = SIZE;
+  off.height = SIZE;
+  const octx = off.getContext("2d");
+
+  // decide pad vs crop, like fit_square() in the python version
+  const w = img.width, h = img.height;
+  octx.fillStyle = "black";
+  if (h > w * 1.15) {
+    // tall image: pad (fit entirely, letterboxed)
+    const scale = Math.min(SIZE / w, SIZE / h);
+    const dw = w * scale, dh = h * scale;
+    const dx = (SIZE - dw) / 2, dy = (SIZE - dh) / 2;
+    octx.fillRect(0, 0, SIZE, SIZE);
+    octx.drawImage(img, dx, dy, dw, dh);
+  } else {
+    // wide/square image: crop to a centred square (like ImageOps.fit)
+    const scale = Math.max(SIZE / w, SIZE / h);
+    const dw = w * scale, dh = h * scale;
+    const dx = (SIZE - dw) / 2, dy = (SIZE - dh) / 2;
+    octx.drawImage(img, dx, dy, dw, dh);
+  }
+
+  const frame = octx.getImageData(0, 0, SIZE, SIZE);
+  const d = frame.data;
+
+  // corner background colour, same idea as corner_colour() in python
+  const corners = [
+    [0, 0], [SIZE - 1, 0], [0, SIZE - 1], [SIZE - 1, SIZE - 1]
+  ].map(([x, y]) => {
+    const idx = (y * SIZE + x) * 4;
+    return [d[idx], d[idx + 1], d[idx + 2]];
+  });
+  const bg = [0, 1, 2].map(ch => Math.round(corners.reduce((s, c) => s + c[ch], 0) / 4));
+
+  // gate/shade = max channel difference from background, autocontrasted
+  const gate = new Float32Array(SIZE * SIZE);
+  let maxDiff = 0;
+  for (let p = 0; p < SIZE * SIZE; p++) {
+    const idx = p * 4;
+    const diff = Math.max(
+      Math.abs(d[idx] - bg[0]),
+      Math.abs(d[idx + 1] - bg[1]),
+      Math.abs(d[idx + 2] - bg[2])
+    );
+    gate[p] = diff;
+    if (diff > maxDiff) maxDiff = diff;
+  }
+  if (maxDiff < 1) maxDiff = 1;
+  for (let p = 0; p < SIZE * SIZE; p++) gate[p] = gate[p] / maxDiff; // 0..1, autocontrast-like
+
+  gateData = gate;
+  shadeData = gate;      // background mode: gate and shade are the same map
+  colourData = d;        // raw RGBA pixels, for "picture" colour mode
+}
+
+function sample(x, y) {
+  const ix = Math.floor(x - cx + SIZE / 2);
+  const iy = Math.floor(y - cy + SIZE / 2);
+  if (ix >= 0 && ix < SIZE && iy >= 0 && iy < SIZE) {
+    const p = iy * SIZE + ix;
+    return { g: gateData[p], b: shadeData[p], ix, iy };
+  }
+  return { g: 0, b: 0, ix: 0, iy: 0 };
+}
+
+function makeColour(ix, iy, r, b) {
+  if (COLOUR === "picture") {
+    const idx = (iy * SIZE + ix) * 4;
+    let R = colourData[idx], G = colourData[idx + 1], B = colourData[idx + 2];
+    const k = (FLOOR + (255 - FLOOR) * b) / Math.max(R, G, B, 1);
+    R = Math.min(255, Math.round(R * k));
+    G = Math.min(255, Math.round(G * k));
+    B = Math.min(255, Math.round(B * k));
+    return `rgb(${R},${G},${B})`;
+  } else if (COLOUR === "rainbow") {
+    const hue = (r / (SIZE / 2)) % 1;
+    const [R, G, B] = hsvToRgb(hue, 0.9, 0.35 + 0.65 * b);
+    return `rgb(${R},${G},${B})`;
+  } else {
+    const R = Math.round(FLOOR + (255 - FLOOR) * b);
+    const G = Math.round(40 * b);
+    const B = Math.round(30 * b);
+    return `rgb(${R},${G},${B})`;
+  }
+}
+
+function hsvToRgb(h, s, v) {
+  let r, g, b;
+  const i = Math.floor(h * 6);
+  const f = h * 6 - i;
+  const p = v * (1 - s);
+  const q = v * (1 - f * s);
+  const t = v * (1 - (1 - f) * s);
+  switch (i % 6) {
+    case 0: r = v, g = t, b = p; break;
+    case 1: r = q, g = v, b = p; break;
+    case 2: r = p, g = v, b = t; break;
+    case 3: r = p, g = q, b = v; break;
+    case 4: r = t, g = p, b = v; break;
+    case 5: r = v, g = p, b = q; break;
+  }
+  return [Math.round(r * 255), Math.round(g * 255), Math.round(b * 255)];
+}
+
+function step() {
+  for (let k = 0; k < PER_FRAME; k++) {
+    const r = GAP * theta / (2 * Math.PI);
+    if (r > SIZE / 2) return; // finished
+
+    const x = cx + r * Math.cos(theta);
+    const y = cy + r * Math.sin(theta);
+    const { g, b, ix, iy } = sample(x, y);
+    const size = MIN_FONT + (MAX_FONT - MIN_FONT) * b;
+
+    if (g > THRESH) {
+      const ch = TEXT[i % TEXT.length];
+      ctx.save();
+      ctx.translate(x, y);
+      ctx.rotate(-(theta + Math.PI / 2)); // match python's angle convention
+      ctx.fillStyle = makeColour(ix, iy, r, b);
+      ctx.font = `bold ${size}px Consolas, monospace`;
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText(ch, 0, 0);
+      ctx.restore();
+    }
+
+    i += 1;
+    theta += Math.min(size * 0.55 / Math.max(r, 1), 0.5);
+  }
+  animId = requestAnimationFrame(step);
+}
+
+function start(img) {
+  if (animId) cancelAnimationFrame(animId);
+  ctx.fillStyle = "black";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  loadImage(img);
+  theta = 4 * Math.PI;
+  i = 0;
+  step();
+}
+
+// ---------------- UI wiring ----------------
+const fileInput = document.getElementById("fileInput");
+const textInput = document.getElementById("textInput");
+const colourSelect = document.getElementById("colourSelect");
+const defaultBtn = document.getElementById("defaultBtn");
+const hint = document.getElementById("hint");
+let lastImage = null;
+
+fileInput.addEventListener("change", (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = (ev) => {
+    const img = new Image();
+    img.onload = () => {
+      lastImage = img;
+      hint.textContent = "Drawing...";
+      start(img);
+    };
+    img.src = ev.target.result;
+  };
+  reader.readAsDataURL(file);
+});
+
+textInput.addEventListener("change", () => {
+  TEXT = textInput.value.length ? textInput.value : "BMW ";
+  if (lastImage) start(lastImage);
+});
+
+colourSelect.addEventListener("change", () => {
+  COLOUR = colourSelect.value;
+  if (lastImage) start(lastImage);
+});
+
+defaultBtn.addEventListener("click", () => {
+  COLOUR = "picture";
+  colourSelect.value = "picture";
+  if (lastImage) start(lastImage);
+});
+
+window.addEventListener("resize", () => {
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+  ctx.fillStyle = "black";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  if (lastImage) start(lastImage);
+});
+</script>
+</body>
+</html>
